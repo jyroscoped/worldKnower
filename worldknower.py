@@ -5,34 +5,70 @@ worldknower – Automated WorldGuessr solver.
 Workflow:
   1. Open https://www.worldguessr.com/ and start a singleplayer round.
   2. Take a screenshot of the location panorama.
-  3. Send the screenshot to the Hugging Face Inference API (BLIP VQA) –
-     completely free, no API key required for anonymous use.
-  4. Parse the AI answer to identify the geographic region.
-  5. Convert that region to approximate lat/lon coordinates.
-  6. Find the minimap in the corner, convert lat/lon → pixel (Mercator),
+    3. Send the screenshot to Gemini Vision and request a strict
+         `region, country` reply.
+    4. Fall back to Hugging Face / local captioning when needed.
+    5. Parse the AI answer to identify the geographic region.
+    6. Convert that region to approximate lat/lon coordinates.
+    7. Find the minimap in the corner, convert lat/lon → pixel (Mercator),
      and click the correct spot.
-  7. Submit the guess.
+    8. Submit the guess.
 """
 
+import argparse
 import asyncio
 import base64
+import io
+import json
 import math
+import os
+import re
 import time
 from pathlib import Path
 
 import requests
+from dotenv import load_dotenv
+from PIL import Image
 from playwright.async_api import Page, async_playwright
 
+load_dotenv()
+
+_REQ_TIMEOUT = 60
+
 # ---------------------------------------------------------------------------
-# Hugging Face Inference API  (free, no API key needed for anonymous access)
+# Hugging Face Inference API (router endpoint; token-based auth)
 # ---------------------------------------------------------------------------
 _HF_VQA_URL = (
-    "https://api-inference.huggingface.co/models/Salesforce/blip-vqa-base"
+    "https://router.huggingface.co/hf-inference/models/Salesforce/blip-vqa-base"
 )
-_HF_CAPTION_URL = (
-    "https://api-inference.huggingface.co"
-    "/models/Salesforce/blip-image-captioning-large"
+_HF_CAPTION_URLS = [
+    "https://router.huggingface.co/hf-inference/models/Salesforce/blip-image-captioning-large",
+    "https://router.huggingface.co/hf-inference/models/Salesforce/blip-image-captioning-base",
+    "https://router.huggingface.co/hf-inference/models/nlpconnect/vit-gpt2-image-captioning",
+]
+_HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+_LOCAL_CAPTION_MODEL = os.environ.get(
+    "LOCAL_CAPTION_MODEL", "Salesforce/blip-image-captioning-base"
 )
+_GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+_GEMINI_MODEL_FALLBACKS = [
+    m.strip()
+    for m in os.environ.get(
+        "GEMINI_MODEL_FALLBACKS", "gemini-2.0-flash-lite,gemini-flash-latest"
+    ).split(",")
+    if m.strip()
+]
+_GEMINI_MAX_RETRIES = max(1, int(os.environ.get("GEMINI_MAX_RETRIES", "2")))
+
+VERBOSE = False
+_LOCAL_CAPTION_PIPELINE = None
+
+
+def vprint(message: str) -> None:
+    """Print verbose diagnostics only when verbose mode is enabled."""
+    if VERBOSE:
+        print(message)
 
 # ---------------------------------------------------------------------------
 # Geographic region → (latitude, longitude) lookup table
@@ -149,7 +185,7 @@ REGION_COORDS: dict[str, tuple[float, float]] = {
 
 
 # ---------------------------------------------------------------------------
-# AI image analysis (free, no API key)
+# AI image analysis (remote HF + local fallback)
 # ---------------------------------------------------------------------------
 
 def _wait_for_model(response: requests.Response) -> float:
@@ -161,10 +197,267 @@ def _wait_for_model(response: requests.Response) -> float:
         return 20.0
 
 
+def _sleep_with_progress(seconds: float, label: str) -> None:
+    """Sleep while printing progress updates so work is visible live."""
+    total = max(1, int(round(seconds)))
+    for i in range(total):
+        vprint(f"  [{label}] waiting... {i + 1}/{total}s")
+        time.sleep(1)
+
+
+def preprocess_image_for_hf(image_bytes: bytes, max_side: int = 768) -> bytes:
+    """Resize/compress screenshot so free inference endpoints accept payload size."""
+    original_size = len(image_bytes)
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        img = img.convert("RGB")
+        img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=78, optimize=True)
+        processed = out.getvalue()
+
+    vprint(
+        "  [preprocess] image bytes "
+        f"{original_size:,} -> {len(processed):,} "
+        f"({(len(processed) / max(original_size, 1)) * 100:.1f}% of original)"
+    )
+    return processed
+
+
+def _hf_headers(content_type: str) -> dict[str, str]:
+    """Build Hugging Face request headers, adding auth token when available."""
+    headers = {"Content-Type": content_type}
+    if _HF_TOKEN:
+        headers["Authorization"] = f"Bearer {_HF_TOKEN}"
+    return headers
+
+
+def _normalize_region_country(text: str) -> str:
+    """Return a compact 'region, country' style location string."""
+    cleaned = text.strip().replace("\n", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip("` ")
+
+    if not cleaned:
+        return ""
+
+    json_match = re.search(r"\{.*\}", cleaned)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(0))
+            region = str(data.get("region", "")).strip()
+            country = str(data.get("country", "")).strip()
+            if country:
+                return f"{region}, {country}".strip(", ")
+        except Exception:
+            pass
+
+    cleaned = re.sub(r"(?i)^region\s*:\s*", "", cleaned)
+    cleaned = re.sub(r"(?i)\bcountry\s*:\s*", "", cleaned)
+    cleaned = cleaned.strip(" ,")
+
+    for sep in [".", ";", "|"]:
+        if sep in cleaned:
+            cleaned = cleaned.split(sep, 1)[0].strip()
+
+    return cleaned
+
+
+def _is_usable_region_country(text: str) -> bool:
+    """Accept only likely 'region, country' values for map matching."""
+    if not text:
+        return False
+    if "," not in text:
+        return False
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    if len(parts) < 2:
+        return False
+    if len(parts[-1]) < 3:
+        return False
+    return True
+
+
+def _gemini_endpoint_for(model: str) -> str:
+    model_id = model.removeprefix("models/")
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
+
+
+def _extract_gemini_retry_after(resp: requests.Response, default_wait: int) -> int:
+    """Extract recommended wait time from headers/body for 429 responses."""
+    retry_after = resp.headers.get("Retry-After", "").strip()
+    if retry_after.isdigit():
+        return max(1, int(retry_after))
+
+    try:
+        data = resp.json()
+        details = data.get("error", {}).get("details", [])
+        for d in details:
+            delay = str(d.get("retryDelay", "")).strip()
+            if delay.endswith("s"):
+                return max(1, int(float(delay[:-1])))
+    except Exception:
+        pass
+
+    return default_wait
+
+
+def _is_quota_exhausted(resp: requests.Response) -> bool:
+    """Detect non-recoverable quota exhaustion from Gemini error payload."""
+    text = resp.text.lower()
+    return "quota" in text or "resource_exhausted" in text
+
+
+def query_gemini_region_country(image_bytes: bytes) -> str:
+    """Ask Gemini Vision for one-line region,country output."""
+    if not _GEMINI_API_KEY:
+        return ""
+
+    prompt = (
+        "Identify the most likely location from this street-view image. "
+        "Reply with exactly one short line in this format: <region>, <country>. "
+        "No explanation, no markdown, no extra text."
+    )
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": base64.b64encode(image_bytes).decode("utf-8"),
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 64},
+    }
+
+    models_to_try = [_GEMINI_MODEL] + [m for m in _GEMINI_MODEL_FALLBACKS if m != _GEMINI_MODEL]
+
+    # 1) Prefer official SDK path (as recommended in Gemini docs).
+    try:
+        from google import genai
+        from google.genai import errors as genai_errors
+
+        client = genai.Client(api_key=_GEMINI_API_KEY)
+        for model in models_to_try:
+            print(f"  [gemini-sdk] Using model: {model}")
+            for attempt in range(_GEMINI_MAX_RETRIES):
+                try:
+                    vprint(
+                        f"  [gemini-sdk] attempt {attempt + 1}/{_GEMINI_MAX_RETRIES} -> {model}"
+                    )
+                    response = client.models.generate_content(
+                        model=model,
+                        contents=[
+                            prompt,
+                            {
+                                "inline_data": {
+                                    "mime_type": "image/jpeg",
+                                    "data": base64.b64encode(image_bytes).decode("utf-8"),
+                                }
+                            },
+                        ],
+                    )
+                    raw_text = (response.text or "").strip()
+                    guess = _normalize_region_country(raw_text)
+                    if _is_usable_region_country(guess):
+                        return guess
+                    if guess:
+                        print(f"  [gemini-sdk] Ignoring non region,country reply: '{guess}'")
+                        break
+                except genai_errors.ClientError as exc:
+                    msg = str(exc)
+                    msg_lower = msg.lower()
+                    if "resource_exhausted" in msg_lower or "429" in msg_lower:
+                        if "limit: 0" in msg_lower or "quota exceeded" in msg_lower:
+                            print(
+                                "  [gemini-sdk] Quota exhausted (limit 0) for this model; switching model."
+                            )
+                            break
+                        wait = 2 + attempt * 2
+                        if attempt >= _GEMINI_MAX_RETRIES - 1:
+                            print("  [gemini-sdk] HTTP 429 after retries; switching model.")
+                            break
+                        print(f"  [gemini-sdk] HTTP 429; retrying in {wait}s...")
+                        _sleep_with_progress(wait, "gemini-sdk")
+                        continue
+                    if "404" in msg_lower or "not found" in msg_lower:
+                        print(f"  [gemini-sdk] Model unavailable: {model}; switching model.")
+                        break
+                    if "401" in msg_lower or "permission_denied" in msg_lower:
+                        print("  [gemini-sdk] Invalid GEMINI_API_KEY or permissions.")
+                        return ""
+                    print(f"  [gemini-sdk] Error: {msg[:180]}")
+                    break
+                except Exception as exc:
+                    print(f"  [gemini-sdk] Error: {exc}")
+                    break
+    except Exception as exc:
+        print(f"  [gemini-sdk] Unavailable ({exc}); falling back to REST.")
+
+    # 2) REST fallback path.
+    for model in models_to_try:
+        endpoint = _gemini_endpoint_for(model)
+        print(f"  [gemini] Using model: {model}")
+        for attempt in range(_GEMINI_MAX_RETRIES):
+            try:
+                vprint(
+                    f"  [gemini] POST attempt {attempt + 1}/{_GEMINI_MAX_RETRIES} -> {model}"
+                )
+                resp = requests.post(
+                    endpoint,
+                    params={"key": _GEMINI_API_KEY},
+                    json=payload,
+                    timeout=_REQ_TIMEOUT,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        raw_text = " ".join(str(p.get("text", "")) for p in parts).strip()
+                        guess = _normalize_region_country(raw_text)
+                        if _is_usable_region_country(guess):
+                            return guess
+                        if guess:
+                            print(f"  [gemini] Ignoring non region,country reply: '{guess}'")
+                            break
+                elif resp.status_code == 429:
+                    if _is_quota_exhausted(resp):
+                        print("  [gemini] HTTP 429: quota exhausted for this model; switching model.")
+                        break
+
+                    wait = _extract_gemini_retry_after(resp, default_wait=2 + attempt * 2)
+                    if attempt >= _GEMINI_MAX_RETRIES - 1:
+                        print("  [gemini] HTTP 429 after retries; switching model.")
+                        break
+                    print(f"  [gemini] HTTP 429; retrying in {wait}s...")
+                    _sleep_with_progress(wait, "gemini")
+                elif resp.status_code == 503:
+                    wait = _extract_gemini_retry_after(resp, default_wait=3 + attempt * 2)
+                    if attempt >= _GEMINI_MAX_RETRIES - 1:
+                        print("  [gemini] HTTP 503 after retries; switching model.")
+                        break
+                    print(f"  [gemini] HTTP 503; retrying in {wait}s...")
+                    _sleep_with_progress(wait, "gemini")
+                elif resp.status_code == 401:
+                    print("  [gemini] HTTP 401: invalid GEMINI_API_KEY.")
+                    return ""
+                else:
+                    print(f"  [gemini] HTTP {resp.status_code}: {resp.text[:160]}")
+                    break
+            except requests.RequestException as exc:
+                print(f"  [gemini] Request error: {exc}")
+                break
+
+    return ""
+
+
 def query_vqa(image_bytes: bytes, question: str) -> str:
     """
     Ask a visual question about the image using BLIP-VQA.
-    Uses the Hugging Face Inference API anonymously (free, no API key).
+    Uses the Hugging Face Inference API.
     Returns the model's text answer, or '' on failure.
     """
     payload = {
@@ -173,9 +466,16 @@ def query_vqa(image_bytes: bytes, question: str) -> str:
             "image": base64.b64encode(image_bytes).decode("utf-8"),
         }
     }
+    vprint(f"  [VQA] payload size: {len(payload['inputs']['image']):,} b64 chars")
     for attempt in range(4):
         try:
-            resp = requests.post(_HF_VQA_URL, json=payload, timeout=60)
+            vprint(f"  [VQA] POST attempt {attempt + 1}/4 -> {_HF_VQA_URL}")
+            resp = requests.post(
+                _HF_VQA_URL,
+                json=payload,
+                headers=_hf_headers("application/json"),
+                timeout=_REQ_TIMEOUT,
+            )
             if resp.status_code == 200:
                 result = resp.json()
                 if isinstance(result, list) and result:
@@ -186,7 +486,14 @@ def query_vqa(image_bytes: bytes, question: str) -> str:
                 wait = _wait_for_model(resp)
                 print(f"  [VQA] Model loading, retrying in {wait:.0f}s… "
                       f"(attempt {attempt + 1}/4)")
-                time.sleep(min(wait, 30))
+                _sleep_with_progress(min(wait, 30), "VQA")
+            elif resp.status_code == 401:
+                print("  [VQA] HTTP 401: Hugging Face token required.")
+                print("  [VQA] Set HF_TOKEN in your environment and re-run.")
+                break
+            elif resp.status_code == 413:
+                print("  [VQA] HTTP 413: payload too large even after preprocessing.")
+                break
             else:
                 print(f"  [VQA] HTTP {resp.status_code}: {resp.text[:120]}")
                 break
@@ -200,34 +507,69 @@ def query_caption(image_bytes: bytes) -> str:
     """
     Generate a caption for the image using BLIP-image-captioning-large.
     Used as a fallback when VQA returns no useful answer.
-    Uses the Hugging Face Inference API anonymously (free, no API key).
+    Uses the Hugging Face Inference API.
     Returns the generated caption, or '' on failure.
     """
-    for attempt in range(4):
-        try:
-            resp = requests.post(
-                _HF_CAPTION_URL,
-                data=image_bytes,
-                headers={"Content-Type": "image/png"},
-                timeout=60,
-            )
-            if resp.status_code == 200:
-                result = resp.json()
-                if isinstance(result, list) and result:
-                    return str(result[0].get("generated_text", "")).strip()
-                if isinstance(result, dict):
-                    return str(result.get("generated_text", "")).strip()
-            elif resp.status_code == 503:
-                wait = _wait_for_model(resp)
-                print(f"  [caption] Model loading, retrying in {wait:.0f}s… "
-                      f"(attempt {attempt + 1}/4)")
-                time.sleep(min(wait, 30))
-            else:
-                print(f"  [caption] HTTP {resp.status_code}: {resp.text[:120]}")
+    for url in _HF_CAPTION_URLS:
+        print(f"  [caption] Trying model: {url.rsplit('/', 1)[-1]}")
+        for attempt in range(3):
+            try:
+                vprint(f"  [caption] POST attempt {attempt + 1}/3 -> {url}")
+                resp = requests.post(
+                    url,
+                    data=image_bytes,
+                    headers=_hf_headers("image/jpeg"),
+                    timeout=_REQ_TIMEOUT,
+                )
+                if resp.status_code == 200:
+                    result = resp.json()
+                    if isinstance(result, list) and result:
+                        return str(result[0].get("generated_text", "")).strip()
+                    if isinstance(result, dict):
+                        return str(result.get("generated_text", "")).strip()
+                elif resp.status_code == 503:
+                    wait = _wait_for_model(resp)
+                    print(
+                        f"  [caption] Model loading, retrying in {wait:.0f}s… "
+                        f"(attempt {attempt + 1}/3)"
+                    )
+                    _sleep_with_progress(min(wait, 30), "caption")
+                elif resp.status_code == 401:
+                    print("  [caption] HTTP 401: Hugging Face token required.")
+                    print("  [caption] Set HF_TOKEN in your environment and re-run.")
+                    return ""
+                else:
+                    print(f"  [caption] HTTP {resp.status_code}: {resp.text[:120]}")
+                    break
+            except requests.RequestException as exc:
+                print(f"  [caption] Request error: {exc}")
                 break
-        except requests.RequestException as exc:
-            print(f"  [caption] Request error: {exc}")
-            break
+    return ""
+
+
+def query_local_caption(image_bytes: bytes) -> str:
+    """Run local image captioning as a robust fallback when remote inference fails."""
+    global _LOCAL_CAPTION_PIPELINE
+    try:
+        if _LOCAL_CAPTION_PIPELINE is None:
+            print(f"  [local-caption] Loading local model: {_LOCAL_CAPTION_MODEL}")
+            print("  [local-caption] First run may take a while (downloading weights).")
+            from transformers import pipeline
+
+            _LOCAL_CAPTION_PIPELINE = pipeline(
+                "image-to-text",
+                model=_LOCAL_CAPTION_MODEL,
+            )
+
+        pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        result = _LOCAL_CAPTION_PIPELINE(pil_image, max_new_tokens=40)
+        if isinstance(result, list) and result:
+            return str(result[0].get("generated_text", "")).strip()
+        if isinstance(result, dict):
+            return str(result.get("generated_text", "")).strip()
+    except Exception as exc:
+        print(f"  [local-caption] Error: {exc}")
+
     return ""
 
 
@@ -237,6 +579,27 @@ def analyze_location(image_bytes: bytes) -> str:
     Tries VQA first; falls back to image captioning.
     Returns a text description that contains geographic keywords.
     """
+    prepared_image = preprocess_image_for_hf(image_bytes)
+
+    if _GEMINI_API_KEY:
+        print(f"  Trying Gemini geolocation model ({_GEMINI_MODEL})...")
+        gemini_guess = query_gemini_region_country(prepared_image)
+        if gemini_guess:
+            print(f"  Gemini guess: '{gemini_guess}'")
+            return gemini_guess
+        print("  Gemini returned no usable location; falling back...")
+    else:
+        print("  GEMINI_API_KEY not set; skipping Gemini geolocation.")
+
+    if not _HF_TOKEN:
+        print("  HF_TOKEN is not set; skipping remote HF and using local caption fallback.")
+        local_caption = query_local_caption(prepared_image)
+        if local_caption:
+            normalized = _normalize_region_country(local_caption)
+            print(f"  Local caption: '{normalized or local_caption}'")
+            return normalized or local_caption
+        return ""
+
     questions = [
         "What country is this?",
         "What country or continent is shown in this image?",
@@ -244,15 +607,24 @@ def analyze_location(image_bytes: bytes) -> str:
     ]
     for question in questions:
         print(f"  Asking: '{question}'")
-        answer = query_vqa(image_bytes, question)
+        answer = query_vqa(prepared_image, question)
         if answer:
-            print(f"  Answer: '{answer}'")
-            return answer
+            normalized = _normalize_region_country(answer)
+            print(f"  Answer: '{normalized or answer}'")
+            return normalized or answer
 
     print("  VQA returned no answer; trying image captioning…")
-    caption = query_caption(image_bytes)
-    print(f"  Caption: '{caption}'")
-    return caption
+    caption = query_caption(prepared_image)
+    if caption:
+        normalized = _normalize_region_country(caption)
+        print(f"  Caption: '{normalized or caption}'")
+        return normalized or caption
+
+    print("  Remote captioning returned nothing; trying local AI fallback…")
+    local_caption = query_local_caption(prepared_image)
+    normalized = _normalize_region_country(local_caption)
+    print(f"  Local caption: '{normalized or local_caption}'")
+    return normalized or local_caption
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +697,16 @@ _START_SELECTORS = [
     "#play",
 ]
 
+# Buttons that often block the panorama on first load and should be dismissed.
+_PREPARE_VIEW_SELECTORS = [
+    "button:has-text('Skip tutorial')",
+    "button:has-text('Skip')",
+    "button:has-text('Show Street View')",
+    "button:has-text('Start')",
+    "button:has-text('Continue')",
+    "button:has-text('OK')",
+]
+
 # Selectors that indicate the panorama/game view is active
 _GAME_INDICATORS = [
     "canvas",
@@ -383,6 +765,12 @@ async def start_game(page: Page) -> None:
             await page.wait_for_timeout(2000)
             break
 
+    # Dismiss tutorial overlays / reveal street view when present.
+    for selector in _PREPARE_VIEW_SELECTORS:
+        if await _try_click(page, selector):
+            print(f"  Clicked view-prep button: {selector}")
+            await page.wait_for_timeout(1200)
+
     # Some sites show a second confirmation modal
     secondary = [
         "button:has-text('Start')",
@@ -394,6 +782,23 @@ async def start_game(page: Page) -> None:
             print(f"  Clicked secondary button: {sel}")
             await page.wait_for_timeout(1500)
             break
+
+
+async def wait_for_game_view(page: Page, timeout_ms: int = 20_000) -> bool:
+    """Wait until panorama/game UI indicators are visible before screenshotting."""
+    deadline = time.time() + (timeout_ms / 1000)
+    while time.time() < deadline:
+        for selector in _GAME_INDICATORS:
+            try:
+                el = await page.query_selector(selector)
+                if el and await el.is_visible():
+                    vprint(f"  [game] active indicator: {selector}")
+                    return True
+            except Exception:
+                continue
+        await page.wait_for_timeout(500)
+
+    return False
 
 
 async def find_minimap(page: Page) -> tuple | None:
@@ -452,9 +857,14 @@ async def submit_guess(page: Page) -> None:
 async def run() -> None:
     print("=== worldknower starting ===")
 
+    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    headless_mode = not has_display
+    if headless_mode:
+        print("No GUI display detected; launching browser in headless mode.")
+
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
-            headless=False,
+            headless=headless_mode,
             args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
         ctx = await browser.new_context(
@@ -477,8 +887,11 @@ async def run() -> None:
         print("[1] Starting singleplayer game…")
         await start_game(page)
 
-        # Extra wait for the panorama to render
-        await page.wait_for_timeout(4000)
+        # Wait for the panorama/game UI to be ready before screenshotting
+        ready = await wait_for_game_view(page)
+        if not ready:
+            print("  Warning: game view indicators not detected; continuing anyway.")
+            await page.wait_for_timeout(2000)
 
         # ── Step 2: screenshot ────────────────────────────────────────────
         print("\n[2] Taking screenshot of the location…")
@@ -488,7 +901,7 @@ async def run() -> None:
         print(f"    Saved to {out_path}")
 
         # ── Step 3: AI analysis ──────────────────────────────────────────
-        print("\n[3] Analysing with free AI (Hugging Face, no API key)…")
+        print("\n[3] Analysing location with AI…")
         description = analyze_location(screenshot_bytes)
 
         if not description:
@@ -527,4 +940,13 @@ async def run() -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Automated WorldGuessr solver")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show verbose live logs (API attempts, waits, payload sizes)",
+    )
+    args = parser.parse_args()
+
+    VERBOSE = args.verbose
     asyncio.run(run())
